@@ -295,19 +295,22 @@ class Telegram:
             if isinstance(event, tl_types.UpdateMessageReactions):
                 update_dict["message_id"] = event.msg_id
                 reactions_out = []
-                if event.reactions and event.reactions.results:
-                    for rc in event.reactions.results:
-                        r = rc.reaction
-                        emoji = None
-                        if isinstance(r, tl_types.ReactionEmoji):
-                            emoji = r.emoticon
-                        elif hasattr(r, "document_id"):
-                            emoji = f"custom:{r.document_id}"
-                        reactions_out.append({
-                            "emoji": emoji,
-                            "count": rc.count,
-                            "chosen": rc.chosen_order is not None,
-                        })
+                try:
+                    if event.reactions and event.reactions.results:
+                        for rc in event.reactions.results:
+                            r = rc.reaction
+                            emoji = None
+                            if hasattr(r, "emoticon"):
+                                emoji = r.emoticon
+                            elif hasattr(r, "document_id"):
+                                emoji = f"custom:{r.document_id}"
+                            reactions_out.append({
+                                "emoji": emoji,
+                                "count": rc.count,
+                                "chosen": getattr(rc, "chosen_order", None) is not None,
+                            })
+                except Exception:
+                    pass
                 update_dict["reactions"] = reactions_out
 
             _enqueue(update_dict)
