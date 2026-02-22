@@ -291,6 +291,25 @@ class Telegram:
             if chat_id is not None:
                 update_dict["chat_id"] = chat_id
 
+            # Extract structured fields for reaction updates
+            if isinstance(event, tl_types.UpdateMessageReactions):
+                update_dict["message_id"] = event.msg_id
+                reactions_out = []
+                if event.reactions and event.reactions.results:
+                    for rc in event.reactions.results:
+                        r = rc.reaction
+                        emoji = None
+                        if isinstance(r, tl_types.ReactionEmoji):
+                            emoji = r.emoticon
+                        elif hasattr(r, "document_id"):
+                            emoji = f"custom:{r.document_id}"
+                        reactions_out.append({
+                            "emoji": emoji,
+                            "count": rc.count,
+                            "chosen": rc.chosen_order is not None,
+                        })
+                update_dict["reactions"] = reactions_out
+
             _enqueue(update_dict)
 
     async def get_user_info(self, entity: str | int) -> dict:
