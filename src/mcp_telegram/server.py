@@ -1,556 +1,516 @@
-"""MCP Telegram Server - Unified MTProto + Bot API.
-
-Provides MCP tools for:
-- user_* — MTProto (send from personal account via daemon)
-- bot_* — Bot API (communication channel)
-
-Usage:
-    tg mcp  # Start MCP server
-"""
+"""MCP Telegram Server."""
 
 import asyncio
-from typing import Any
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-import httpx
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.server.fastmcp import FastMCP
 
-from mcp_telegram.config import load_config
-from mcp_telegram.bot.client import BotClient
-
-# =============================================================================
-# Server Setup
-# =============================================================================
-
-server = Server("mcp-telegram")
+from mcp_telegram.telegram import Telegram
+from mcp_telegram.types import Dialog, DownloadedMedia, Message, Messages
+from mcp_telegram.utils import parse_entity
 
 
-def get_daemon_url() -> str:
-    """Get daemon URL from config."""
-    config = load_config()
-    return config.daemon.url
+@asynccontextmanager
+async def app_lifespan(server: FastMCP) -> AsyncIterator[None]:
+    """Lifespan manager for the app.
 
-
-async def daemon_request(
-    endpoint: str,
-    data: dict | None = None,
-    timeout: float = 60.0,
-) -> dict:
-    """Make request to MTProto daemon."""
-    url = f"{get_daemon_url()}/{endpoint}"
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        if data:
-            response = await client.post(url, json=data)
-        else:
-            response = await client.get(url)
-        return response.json()
-
-
-async def check_daemon() -> tuple[bool, str]:
-    """Check if daemon is running."""
+    This will connect to Telegram on startup and disconnect on shutdown.
+    """
     try:
-        result = await daemon_request("health")
-        if result.get("ok"):
-            user = result.get("user", {})
-            return True, f"Connected as {user.get('first_name')} (@{user.get('username')})"
-        return False, result.get("error", "Unknown error")
-    except Exception as e:
-        return False, f"Daemon not running: {e}"
+        tg.create_client()
+        await tg.client.connect()
+        await tg.register_event_handlers()
+        yield
+    finally:
+        await tg.client.disconnect()  # type: ignore
 
 
-# =============================================================================
-# Tool Definitions
-# =============================================================================
+tg = Telegram()
+mcp = FastMCP(
+    "mcp-telegram",
+    lifespan=app_lifespan,
+)
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
-    """List all available tools."""
-    return [
-        # =====================================================================
-        # User Tools (MTProto via daemon)
-        # =====================================================================
-        Tool(
-            name="user_send_message",
-            description="Send a text message from YOUR Telegram account to any user, group, or channel.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "entity": {
-                        "type": "string",
-                        "description": "Recipient: @username, +phone, chat ID, or 'me' for Saved Messages"
-                    },
-                    "message": {
-                        "type": "string",
-                        "description": "Message text (supports Markdown)"
-                    },
-                    "reply_to": {
-                        "type": "integer",
-                        "description": "Optional: message ID to reply to"
-                    }
-                },
-                "required": ["entity", "message"]
-            }
-        ),
-        Tool(
-            name="user_send_file",
-            description="Send a file from YOUR Telegram account. Can send documents, photos, or voice messages.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "entity": {
-                        "type": "string",
-                        "description": "Recipient: @username, +phone, or chat ID"
-                    },
-                    "file_path": {
-                        "type": "string",
-                        "description": "Absolute path to file"
-                    },
-                    "caption": {
-                        "type": "string",
-                        "description": "Optional caption"
-                    },
-                    "voice": {
-                        "type": "boolean",
-                        "description": "Send as voice message (for audio files)"
-                    }
-                },
-                "required": ["entity", "file_path"]
-            }
-        ),
-        Tool(
-            name="user_get_messages",
-            description="Get message history from any chat in YOUR Telegram account.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "entity": {
-                        "type": "string",
-                        "description": "Chat: @username, +phone, or chat ID"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Number of messages (default: 10)"
-                    }
-                },
-                "required": ["entity"]
-            }
-        ),
-        Tool(
-            name="user_search_dialogs",
-            description="Search contacts and chats in YOUR Telegram account.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query (name or username)"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Number of results (default: 10)"
-                    }
-                },
-                "required": []
-            }
-        ),
-        Tool(
-            name="user_download_media",
-            description="Download media (photo, document, voice) from a message.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "entity": {
-                        "type": "string",
-                        "description": "Chat: @username, +phone, or chat ID"
-                    },
-                    "message_id": {
-                        "type": "integer",
-                        "description": "Message ID containing media"
-                    },
-                    "save_path": {
-                        "type": "string",
-                        "description": "Absolute path to save file"
-                    }
-                },
-                "required": ["entity", "message_id", "save_path"]
-            }
-        ),
-        Tool(
-            name="user_edit_message",
-            description="Edit a message you sent.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "entity": {
-                        "type": "string",
-                        "description": "Chat: @username, +phone, or chat ID"
-                    },
-                    "message_id": {
-                        "type": "integer",
-                        "description": "Message ID to edit"
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "New message text"
-                    }
-                },
-                "required": ["entity", "message_id", "text"]
-            }
-        ),
-        Tool(
-            name="user_delete_messages",
-            description="Delete messages from a chat.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "entity": {
-                        "type": "string",
-                        "description": "Chat: @username, +phone, or chat ID"
-                    },
-                    "message_ids": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "List of message IDs to delete"
-                    }
-                },
-                "required": ["entity", "message_ids"]
-            }
-        ),
-        Tool(
-            name="user_check_daemon",
-            description="Check if the MTProto daemon is running and connected.",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        ),
+@mcp.tool()
+async def send_message(
+    entity: str,
+    message: str = "",
+    file_path: list[str] | None = None,
+    reply_to: int | None = None,
+) -> str:
+    """Send a message to a Telegram user, group, or channel.
 
-        # =====================================================================
-        # Bot Tools (Bot API direct)
-        # =====================================================================
-        Tool(
-            name="bot_send_message",
-            description="Send a message via Telegram bot to the configured chat (Claude -> User communication).",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "Message text (supports Markdown)"
-                    },
-                    "chat_id": {
-                        "type": "string",
-                        "description": "Optional: override default chat ID"
-                    }
-                },
-                "required": ["text"]
-            }
-        ),
-        Tool(
-            name="bot_send_file",
-            description="Send a file via Telegram bot.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Absolute path to file"
-                    },
-                    "caption": {
-                        "type": "string",
-                        "description": "Optional caption"
-                    },
-                    "chat_id": {
-                        "type": "string",
-                        "description": "Optional: override default chat ID"
-                    }
-                },
-                "required": ["file_path"]
-            }
-        ),
-        Tool(
-            name="bot_send_photo",
-            description="Send a photo via Telegram bot.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Absolute path to image"
-                    },
-                    "caption": {
-                        "type": "string",
-                        "description": "Optional caption"
-                    },
-                    "chat_id": {
-                        "type": "string",
-                        "description": "Optional: override default chat ID"
-                    }
-                },
-                "required": ["file_path"]
-            }
-        ),
-        Tool(
-            name="bot_send_voice",
-            description="Send a voice message via Telegram bot.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Absolute path to audio file (.ogg with OPUS preferred)"
-                    },
-                    "caption": {
-                        "type": "string",
-                        "description": "Optional caption"
-                    },
-                    "chat_id": {
-                        "type": "string",
-                        "description": "Optional: override default chat ID"
-                    }
-                },
-                "required": ["file_path"]
-            }
-        ),
-        Tool(
-            name="bot_get_messages",
-            description="Get messages received by the bot (User -> Claude communication).",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Number of messages (default: 10)"
-                    }
-                },
-                "required": []
-            }
-        ),
-        Tool(
-            name="bot_download_file",
-            description="Download a file sent to the bot by file_id.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_id": {
-                        "type": "string",
-                        "description": "Telegram file_id from a message"
-                    },
-                    "save_path": {
-                        "type": "string",
-                        "description": "Absolute path to save the file"
-                    }
-                },
-                "required": ["file_id", "save_path"]
-            }
-        ),
-    ]
+    It allows sending text messages to any Telegram entity identified by `entity`.
+
+    !IMPORTANT: If you are not sure about the entity, use the `search_dialogs`
+    tool and ask the user to select the correct entity from the list.
+
+    Args:
+        entity (`str`): The identifier of where to send the message.
+            This can be a Telegram chat ID, a username, a phone number
+            (in format '+1234567890'), or a group/channel username. The special
+            value "me" can be used to send a message to yourself.
+
+        message (`str`, optional): The text message to be sent.
+            The message supports Markdown formatting including **bold**, __italic__,
+            `monospace`, and [URL](links). The maximum length for a message is 35,000
+            bytes or 4,096 characters.
+
+        file_path (`list[str]`, optional): The list of paths to the files to be sent.
+
+        reply_to (`int`, optional): The message ID to reply to.
+
+    Returns:
+        `str`:
+            A success message if sent, or an error message if failed.
+    """
+
+    _entity = parse_entity(entity)
+
+    await tg.send_message(
+        _entity,
+        message,
+        file_path=file_path,
+        reply_to=reply_to,
+    )
+
+    return f"Message sent to {entity}"
 
 
-# =============================================================================
-# Tool Handlers
-# =============================================================================
+@mcp.tool()
+async def edit_message(entity: str, message_id: int, message: str) -> str:
+    """Edit a message from a specific entity.
+
+    Edits a message from a specific entity.
+
+    !IMPORTANT: If the entity is not found, it will return an error message.
+    If you are not sure about the entity, use the `search_dialogs`
+    tool and ask the user to select the correct entity from the list.
+    If you are not sure about the message ID, use the `get_messages`
+    tool to get the message ID.
+
+    Args:
+        entity (`str`): The identifier of the entity.
+        message_id (`int`): The ID of the message to edit.
+        message (`str`): The message to edit the message to.
+
+    Returns:
+        `str`:
+            A success message if edited, or an error message if failed.
+    """
+
+    _entity = parse_entity(entity)
+
+    await tg.edit_message(_entity, message_id, message)
+
+    return f"Message edited in {entity}"
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    """Handle tool calls."""
+@mcp.tool()
+async def delete_message(entity: str, message_ids: list[int]) -> str:
+    """Delete messages from a specific entity.
 
-    # =========================================================================
-    # User Tools (MTProto via daemon)
-    # =========================================================================
+    Deletes messages from a specific entity.
 
-    if name == "user_check_daemon":
-        ok, msg = await check_daemon()
-        return [TextContent(type="text", text=msg)]
+    !IMPORTANT: If the entity is not found, it will return an error message.
+    If you are not sure about the entity, use the `search_dialogs`
+    tool and ask the user to select the correct entity from the list.
+    If you are not sure about the message IDs, use the `get_messages`
+    tool to get the message IDs.
 
-    if name.startswith("user_"):
-        # Check daemon first
-        ok, msg = await check_daemon()
-        if not ok:
-            return [TextContent(type="text", text=f"Error: {msg}\n\nStart daemon with: tg daemon start")]
+    Args:
+        entity (`str`): The identifier of the entity.
+        message_ids (`list[int]`): The IDs of the messages to delete.
 
-        if name == "user_send_message":
-            result = await daemon_request("send_message", {
-                "entity": arguments["entity"],
-                "message": arguments["message"],
-                "reply_to": arguments.get("reply_to"),
-            })
-            if result.get("ok"):
-                return [TextContent(type="text", text=f"Message sent (ID: {result.get('message_id')})")]
-            return [TextContent(type="text", text=f"Error: {result.get('error')}")]
+    Returns:
+        `str`:
+            A success message if deleted, or an error message if failed.
+    """
 
-        if name == "user_send_file":
-            result = await daemon_request("send_file", {
-                "entity": arguments["entity"],
-                "file_path": arguments["file_path"],
-                "caption": arguments.get("caption", ""),
-                "voice": arguments.get("voice", False),
-            })
-            if result.get("ok"):
-                return [TextContent(type="text", text=f"File sent (ID: {result.get('message_id')})")]
-            return [TextContent(type="text", text=f"Error: {result.get('error')}")]
+    _entity = parse_entity(entity)
 
-        if name == "user_get_messages":
-            result = await daemon_request("get_messages", {
-                "entity": arguments["entity"],
-                "limit": arguments.get("limit", 10),
-            })
-            if result.get("ok"):
-                messages = result.get("messages", [])
-                if not messages:
-                    return [TextContent(type="text", text="No messages found")]
+    await tg.delete_message(_entity, message_ids)
 
-                lines = []
-                for msg in messages:
-                    date = msg.get("date", "")[:10]
-                    msg_id = msg.get("id")
-                    text = msg.get("text", "")[:200]
-                    media = f" [{msg.get('media_type')}]" if msg.get("has_media") else ""
-                    lines.append(f"[{date}] #{msg_id}{media}: {text}")
+    return f"Messages deleted from {entity}"
 
-                return [TextContent(type="text", text="\n".join(lines))]
-            return [TextContent(type="text", text=f"Error: {result.get('error')}")]
 
-        if name == "user_search_dialogs":
-            result = await daemon_request("search_dialogs", {
-                "query": arguments.get("query", ""),
-                "limit": arguments.get("limit", 10),
-            })
-            if result.get("ok"):
-                dialogs = result.get("dialogs", [])
-                if not dialogs:
-                    return [TextContent(type="text", text="No dialogs found")]
+@mcp.tool()
+async def search_dialogs(
+    query: str, limit: int = 10, global_search: bool = False
+) -> list[Dialog]:
+    """Search for users, groups, and channels.
 
-                lines = []
-                for d in dialogs:
-                    dtype = d.get("type", "")
-                    name = d.get("name", "")
-                    username = f"@{d.get('username')}" if d.get("username") else ""
-                    lines.append(f"[{dtype}] {name} {username}")
+    Retrieves users, groups, and channels and filters them based
+    on the provided query. The query performs a case-insensitive search.
 
-                return [TextContent(type="text", text="\n".join(lines))]
-            return [TextContent(type="text", text=f"Error: {result.get('error')}")]
+    !IMPORTANT: If the query doesn't return the correct results, it means that
+    the query is not specific enough. Try to be more specific with the query or
+    use a different query.
 
-        if name == "user_download_media":
-            result = await daemon_request("download_media", {
-                "entity": arguments["entity"],
-                "message_id": arguments["message_id"],
-                "save_path": arguments["save_path"],
-            }, timeout=120.0)
-            if result.get("ok"):
-                return [TextContent(type="text", text=f"Downloaded to: {result.get('path')}")]
-            return [TextContent(type="text", text=f"Error: {result.get('error')}")]
+    Args:
+        query (`str`): A query string to filter the dialogs.
+            The search will return only dialogs where the query string is
+            found within the dialog's title or username.
 
-        if name == "user_edit_message":
-            result = await daemon_request("edit_message", {
-                "entity": arguments["entity"],
-                "message_id": arguments["message_id"],
-                "text": arguments["text"],
-            })
-            if result.get("ok"):
-                return [TextContent(type="text", text=f"Message edited")]
-            return [TextContent(type="text", text=f"Error: {result.get('error')}")]
+        limit (`int`, optional): The maximum number of dialogs to return.
+            Defaults to 10. The limit must be greater than 0.
 
-        if name == "user_delete_messages":
-            result = await daemon_request("delete_messages", {
-                "entity": arguments["entity"],
-                "message_ids": arguments["message_ids"],
-            })
-            if result.get("ok"):
-                return [TextContent(type="text", text=f"Messages deleted")]
-            return [TextContent(type="text", text=f"Error: {result.get('error')}")]
+        global_search (`bool`, optional): Whether to perform a global search.
+            Defaults to False.
 
-    # =========================================================================
-    # Bot Tools (Bot API direct)
-    # =========================================================================
+    Returns:
+        `list[Dialog]`: A list of dialogs that match the query if successful,
+            or an error message if request failed.
+    """
 
-    if name.startswith("bot_"):
-        config = load_config()
-        if not config.has_bot:
-            return [TextContent(type="text", text="Error: Bot not configured. Run: tg login")]
+    return await tg.search_dialogs(query, limit, global_search)
 
-        bot = BotClient(config)
 
+@mcp.tool()
+async def get_draft(entity: str) -> str:
+    """Get the draft message for a specific entity.
+
+    Finds the draft message for an entity specified by username, chat_id,
+    phone number, or 'me'.
+
+    !IMPORTANT: If the entity is not found, it will return an error message.
+    If you are not sure about the entity, use the `search_dialogs`
+    tool and ask the user to select the correct entity from the list.
+
+    Args:
+        entity (`str`):
+            The identifier of the entity to get the draft message for.
+            This can be a Telegram chat ID, a username, a phone number, or 'me'.
+
+    Returns:
+        `str`:
+            The draft message (empty string if no draft) for the specific entity
+            or an error message if request failed.
+    """
+
+    _entity = parse_entity(entity)
+
+    return await tg.get_draft(_entity)
+
+
+@mcp.tool()
+async def set_draft(entity: str, message: str) -> str:
+    """Set a draft message for a specific entity.
+
+    Sets a draft message for an entity specified by username, chat_id,
+    phone number, or 'me'.
+
+    !IMPORTANT: If the entity is not found, it will return an error message.
+    If you are not sure about the entity, use the `search_dialogs`
+    tool and ask the user to select the correct entity from the list.
+
+    Args:
+        entity (`str`):
+            The identifier of the entity to save the draft message for.
+            This can be a Telegram chat ID, a username, a phone number, or 'me'.
+
+        message (`str`):
+            The message to save as a draft.
+
+    Returns:
+        `str`:
+            A success message if saved, or an error message if failed.
+    """
+
+    _entity = parse_entity(entity)
+
+    await tg.set_draft(_entity, message)
+
+    return f"Draft saved for {_entity}"
+
+
+@mcp.tool()
+async def get_messages(
+    entity: str,
+    limit: int = 10,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+    unread: bool = False,
+    mark_as_read: bool = False,
+) -> Messages:
+    """Get messages from a specific entity.
+
+    Retrieves messages from an entity specified by username, chat_id,
+    phone number, or 'me'.
+
+    !IMPORTANT: If the entity is not found, it will return an error message.
+    If you are not sure about the entity, use the `search_dialogs`
+    tool and ask the user to select the correct entity from the list.
+
+    Args:
+        entity (`str`):
+            The identifier of the entity to get messages from.
+            This can be a Telegram chat ID, a username, a phone number, or 'me'.
+
+        limit (`int`, optional):
+            The maximum number of messages to retrieve.
+            Defaults to 10.
+
+        start_date (`datetime`, optional):
+            The start date of the messages to retrieve.
+
+        end_date (`datetime`, optional):
+            The end date of the messages to retrieve.
+
+        unread (`bool`, optional):
+            Whether to get only unread messages.
+            Defaults to False.
+
+        mark_as_read (`bool`, optional):
+            Whether to mark the messages as read.
+            Defaults to False.
+
+    Returns:
+        `Messages`:
+            A list of messages from the entity and the dialog the messages
+            belong to if successful, or an error message if request failed.
+    """
+
+    _entity = parse_entity(entity)
+
+    return await tg.get_messages(
+        _entity,
+        limit,
+        start_date,
+        end_date,
+        unread,
+        mark_as_read,
+    )
+
+
+@mcp.tool()
+async def media_download(
+    entity: str, message_id: int, path: str | None = None
+) -> DownloadedMedia:
+    """Download media from a specific message to a unique local file.
+
+    Retrieves media from an entity specified by username, chat_id,
+    phone number, or 'me' and saves it to a local directory with a unique name.
+
+    !IMPORTANT: If the entity is not found, it will return an error message.
+    If you are not sure about the entity, use the `search_dialogs`
+    tool and ask the user to select the correct entity from the list.
+
+    Args:
+        entity (`str`):
+            The identifier of the entity where the message exists.
+            This can be a Telegram chat ID, a username, a phone number, or 'me'.
+
+        message_id (`int`):
+            The ID of the message containing the media to download.
+
+        path (`str`, optional):
+            The path to save the downloaded media.
+            Defaults to a Path corresponding to `XDG_STATE_HOME`.
+
+    Returns:
+        `DownloadedMedia`:
+            An object containing the absolute path and media details
+            of the downloaded file if successful or an error message.
+    """
+    _entity = parse_entity(entity)
+
+    return await tg.download_media(_entity, message_id, path)
+
+
+@mcp.tool()
+async def message_from_link(link: str) -> Message:
+    """Get a message from a link.
+
+    Retrieves a message from a link.
+
+    !IMPORTANT: If the link is not a valid Telegram message link, or the account
+    is not authorized to access the message, it will return an error message.
+
+    Args:
+        link (`str`): The link to the message.
+
+    Returns:
+        `Message`: The message from the link if successful, or an error message.
+    """
+
+    return await tg.message_from_link(link)
+
+
+@mcp.tool()
+async def get_pending_updates(
+    max_count: int = 100,
+    timeout: float | None = None,
+    min_wait: float | None = None,
+) -> list[dict]:
+    """Drain and return queued Telegram updates since last poll.
+
+    With timeout set, blocks until at least one update arrives or timeout expires.
+    Without timeout, returns immediately (empty list if no updates queued).
+
+    Args:
+        max_count: Maximum number of updates to return. Defaults to 100.
+        timeout: Seconds to wait for at least one update. None = return immediately.
+        min_wait: Minimum seconds to wait before returning, even if an important
+            event arrives early. Useful for batching rapid messages. None = no minimum.
+
+    Returns:
+        list[dict]: List of update dicts (new_message, message_edited, reactions,
+            deletes, read receipts, typing, status), ordered oldest-first.
+    """
+    results: list[dict] = []
+    start = asyncio.get_event_loop().time()
+
+    if timeout is not None:
         try:
-            if name == "bot_send_message":
-                result = await bot.send_message(
-                    arguments["text"],
-                    arguments.get("chat_id"),
-                )
-                return [TextContent(type="text", text=f"Message sent (ID: {result.get('message_id')})")]
+            # Block until an important event arrives (new message, reaction, delete, edit)
+            # Typing and status events do NOT unblock this wait
+            await asyncio.wait_for(tg._important_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        else:
+            tg._important_event.clear()
 
-            if name == "bot_send_file":
-                result = await bot.send_document(
-                    arguments["file_path"],
-                    arguments.get("caption", ""),
-                    arguments.get("chat_id"),
-                )
-                return [TextContent(type="text", text="File sent")]
+    # Enforce minimum wait time after waking (lets rapid follow-up messages accumulate)
+    if min_wait is not None:
+        elapsed = asyncio.get_event_loop().time() - start
+        remaining = min_wait - elapsed
+        if remaining > 0:
+            await asyncio.sleep(remaining)
 
-            if name == "bot_send_photo":
-                result = await bot.send_photo(
-                    arguments["file_path"],
-                    arguments.get("caption", ""),
-                    arguments.get("chat_id"),
-                )
-                return [TextContent(type="text", text="Photo sent")]
+    # Drain all queued updates (important and non-important alike)
+    while not tg._update_queue.empty() and len(results) < max_count:
+        try:
+            results.append(tg._update_queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
 
-            if name == "bot_send_voice":
-                result = await bot.send_voice(
-                    arguments["file_path"],
-                    arguments.get("caption", ""),
-                    arguments.get("chat_id"),
-                )
-                return [TextContent(type="text", text="Voice message sent")]
+    # Update last_active so crash recovery knows when we last checked
+    tg._last_active = datetime.now(timezone.utc)
+    tg._save_subscriptions()
 
-            if name == "bot_get_messages":
-                messages = await bot.get_messages(arguments.get("limit", 10))
-                if not messages:
-                    return [TextContent(type="text", text="No messages")]
-
-                lines = []
-                for msg in messages:
-                    from_user = msg.get("from", {})
-                    text = msg.get("text", "")[:200]
-                    lines.append(f"{from_user.get('first_name', 'Unknown')}: {text}")
-
-                return [TextContent(type="text", text="\n".join(lines))]
-
-            if name == "bot_download_file":
-                result = await bot.download_file(
-                    arguments["file_id"],
-                    arguments["save_path"],
-                )
-                return [TextContent(type="text", text=f"Downloaded to: {result.get('path')}")]
-
-        except Exception as e:
-            return [TextContent(type="text", text=f"Error: {e}")]
-
-    return [TextContent(type="text", text=f"Unknown tool: {name}")]
+    return results
 
 
-# =============================================================================
-# Entry Point
-# =============================================================================
+@mcp.tool()
+async def subscribe_chat(entity: str) -> dict:
+    """Subscribe to a chat so its messages immediately wake the get_pending_updates loop.
+
+    Subscribed chats also have their missed messages fetched automatically on MCP restart.
+    Subscription list is persisted to disk and survives server restarts.
+
+    Args:
+        entity (`str`): Username, chat ID, or phone number to subscribe to.
+
+    Returns:
+        `dict`: chat_id and subscribed=True on success.
+    """
+    _entity = parse_entity(entity)
+    return await tg.subscribe_chat(_entity)
 
 
-def run_server() -> None:
-    """Run the MCP server."""
-    async def main():
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream,
-                write_stream,
-                server.create_initialization_options(),
-            )
+@mcp.tool()
+async def unsubscribe_chat(entity: str) -> dict:
+    """Unsubscribe from a chat. Messages from it will still queue but won't wake the loop.
 
-    asyncio.run(main())
+    Args:
+        entity (`str`): Username, chat ID, or phone number to unsubscribe from.
+
+    Returns:
+        `dict`: chat_id and subscribed=False on success.
+    """
+    _entity = parse_entity(entity)
+    return await tg.unsubscribe_chat(_entity)
 
 
-if __name__ == "__main__":
-    run_server()
+@mcp.tool()
+def list_subscribed_chats() -> list[int]:
+    """Return the list of currently subscribed chat IDs.
+
+    Returns:
+        `list[int]`: List of subscribed chat IDs. Messages from these chats
+            will immediately wake a blocking get_pending_updates call.
+    """
+    return tg.get_subscribed_chats()
+
+
+@mcp.tool()
+async def get_forum_topics(entity: str, limit: int = 100) -> list[dict]:
+    """Get the list of topics (threads) in a forum-enabled Telegram group.
+
+    Only works on supergroups with the forum feature enabled.
+
+    Args:
+        entity (`str`): Username or ID of the forum group.
+        limit (`int`, optional): Maximum number of topics to return. Defaults to 100.
+
+    Returns:
+        `list[dict]`: List of topics, each with id, title, top_message,
+            date, is_closed, is_pinned, and is_hidden.
+    """
+    _entity = parse_entity(entity)
+    return await tg.get_forum_topics(_entity, limit)
+
+
+@mcp.tool()
+async def get_user_photos(
+    entity: str,
+    download_all: bool = False,
+    download_index: int | None = None,
+) -> list[dict]:
+    """Get all profile photos for a Telegram user.
+
+    Returns metadata for all profile photos, with optional download of any or all.
+
+    Args:
+        entity (`str`): Username, user ID, or phone number of the user.
+        download_all (`bool`, optional): If True, download all photos to local files.
+            Defaults to False.
+        download_index (`int`, optional): If set, download only the photo at this
+            index (0 = most recent). Defaults to None (no download).
+
+    Returns:
+        `list[dict]`: List of photo dicts, each with index, photo_id, date,
+            sizes (list of {type, w, h, size}), and path (if downloaded).
+    """
+    _entity = parse_entity(entity)
+    return await tg.get_user_photos(_entity, download_all, download_index)
+
+
+@mcp.tool()
+async def get_user_info(entity: str) -> dict:
+    """Get profile information for a Telegram user.
+
+    Returns user details including bio, verification status, and downloads
+    their current profile photo to a local file if one exists.
+
+    Args:
+        entity (`str`): Username, user ID, or phone number of the user.
+
+    Returns:
+        `dict`: User info including id, username, first_name, last_name, bio,
+            is_bot, is_verified, status, and profile_photo_path (if available).
+    """
+    _entity = parse_entity(entity)
+    return await tg.get_user_info(_entity)
+
+
+@mcp.tool()
+async def get_group_info(entity: str) -> dict:
+    """Get information about a Telegram group or channel.
+
+    Returns group details including description, member count, and admin list.
+    Works with regular groups, supergroups, and broadcast channels.
+
+    Args:
+        entity (`str`): Username, group/channel ID, or invite link.
+
+    Returns:
+        `dict`: Group info including id, title, type, description, members_count,
+            is_forum, is_verified, and admins list.
+    """
+    _entity = parse_entity(entity)
+    return await tg.get_group_info(_entity)

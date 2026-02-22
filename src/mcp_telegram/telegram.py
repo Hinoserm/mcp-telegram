@@ -1,6 +1,8 @@
 """Telegram client wrapper."""
 
+import asyncio
 import itertools
+import json
 import logging
 
 from datetime import datetime, timedelta, timezone
@@ -45,6 +47,14 @@ class Telegram:
         self._downloads_dir.mkdir(parents=True, exist_ok=True)
 
         self._client: TelegramClient | None = None
+        self._update_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+        self._important_event: asyncio.Event = asyncio.Event()
+
+        self._subscriptions_file = self._state_dir / "subscribed_chats.json"
+        self._subscribed_chats: set[int] = set()
+        self._last_active: datetime | None = None
+        self._my_user_id: int | None = None
+        self._my_username: str | None = None
 
     @property
     def client(self) -> TelegramClient:
@@ -91,6 +101,471 @@ class Telegram:
         )
 
         return self._client
+
+    def _load_subscriptions(self) -> None:
+        """Load subscribed chats and last_active timestamp from disk."""
+        try:
+            if self._subscriptions_file.exists():
+                data = json.loads(self._subscriptions_file.read_text())
+                self._subscribed_chats = set(int(c) for c in data.get("chats", []))
+                last_active_str = data.get("last_active")
+                if last_active_str:
+                    self._last_active = datetime.fromisoformat(last_active_str)
+        except Exception as e:
+            logger.warning(f"Failed to load subscriptions: {e}")
+
+    def _save_subscriptions(self) -> None:
+        """Save subscribed chats and last_active timestamp to disk."""
+        try:
+            data = {
+                "chats": list(self._subscribed_chats),
+                "last_active": self._last_active.isoformat() if self._last_active else None,
+            }
+            self._subscriptions_file.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            logger.warning(f"Failed to save subscriptions: {e}")
+
+    async def register_event_handlers(self) -> None:
+        """Register Telethon event handlers to buffer incoming updates.
+
+        Also loads subscriptions from disk, resolves own user ID, and
+        pre-fills the queue with any messages missed while the server was down.
+        """
+        from telethon import events as telethon_events
+        from telethon.tl import types as tl_types
+
+        client = self.client
+        queue = self._update_queue
+        important_event = self._important_event
+
+        # Load persisted subscriptions and last_active timestamp
+        self._load_subscriptions()
+
+        # Resolve own user ID and username for mention detection
+        me = await client.get_me()
+        self._my_user_id = me.id  # type: ignore
+        self._my_username = getattr(me, "username", None)
+
+        # Catch up on missed messages from subscribed chats since last_active
+        if self._last_active and self._subscribed_chats:
+            logger.info(f"Catching up missed messages since {self._last_active.isoformat()}")
+            for chat_id in list(self._subscribed_chats):
+                try:
+                    async for msg in client.iter_messages(chat_id, limit=50):
+                        if msg.date is None or msg.date.tzinfo is None:
+                            continue
+                        msg_date = msg.date.replace(tzinfo=timezone.utc) if msg.date.tzinfo is None else msg.date
+                        if msg_date <= self._last_active:
+                            break
+                        reply_to = msg.reply_to
+                        thread_id = getattr(reply_to, "reply_to_top_id", None) if reply_to else None
+                        reply_to_id = getattr(reply_to, "reply_to_msg_id", None) if reply_to else None
+                        try:
+                            queue.put_nowait({
+                                "type": "new_message",
+                                "timestamp": msg_date.isoformat(),
+                                "chat_id": chat_id,
+                                "message_id": msg.id,
+                                "sender_id": getattr(msg, "sender_id", None),
+                                "text": getattr(msg, "message", None) or "",
+                                "outgoing": getattr(msg, "out", False),
+                                "media_type": type(msg.media).__name__ if getattr(msg, "media", None) else None,
+                                "reply_to": reply_to_id,
+                                "thread_id": thread_id,
+                                "missed": True,
+                            })
+                            important_event.set()
+                        except asyncio.QueueFull:
+                            pass
+                except Exception as e:
+                    logger.warning(f"Failed to catch up messages for chat {chat_id}: {e}")
+
+        # Update last_active to now
+        self._last_active = datetime.now(timezone.utc)
+        self._save_subscriptions()
+
+        def _enqueue(update: dict) -> None:
+            try:
+                queue.put_nowait(update)
+            except asyncio.QueueFull:
+                pass
+
+            # Determine whether this update should wake a blocking get_pending_updates call.
+            # Rules:
+            #   new_message: wake if chat is subscribed OR the message mentions us
+            #   message_edited: wake if chat is subscribed
+            #   reactions/channel-deletes: wake if chat is subscribed (or chat unknown)
+            #   DM deletes (UpdateDeleteMessages): always wake (no chat info available)
+            #   typing, status, read receipts: never wake
+            update_type = update["type"]
+            chat_id = update.get("chat_id")
+
+            should_wake = False
+            if update_type == "new_message":
+                should_wake = (
+                    (chat_id is not None and chat_id in self._subscribed_chats)
+                    or update.get("mentioned", False)
+                )
+            elif update_type == "message_edited":
+                should_wake = chat_id is not None and chat_id in self._subscribed_chats
+            elif update_type in ("UpdateMessageReactions", "UpdateDeleteChannelMessages"):
+                # Wake if subscribed, or if we couldn't determine the chat
+                should_wake = chat_id is None or chat_id in self._subscribed_chats
+            elif update_type == "UpdateDeleteMessages":
+                # No chat info in this update type — always wake (DM deletions)
+                should_wake = True
+
+            if should_wake:
+                important_event.set()
+
+        @client.on(telethon_events.NewMessage())
+        async def _on_new_message(event):
+            reply_to = event.message.reply_to
+            thread_id = getattr(reply_to, "reply_to_top_id", None) if reply_to else None
+            reply_to_id = getattr(reply_to, "reply_to_msg_id", None) if reply_to else None
+            # Telethon sets message.mentioned=True if the current user was @-mentioned
+            mentioned = getattr(event.message, "mentioned", False)
+            _enqueue({
+                "type": "new_message",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "chat_id": event.chat_id,
+                "message_id": event.message.id,
+                "sender_id": event.sender_id,
+                "text": event.message.message or "",
+                "outgoing": event.message.out,
+                "media_type": type(event.message.media).__name__ if event.message.media else None,
+                "reply_to": reply_to_id,
+                "thread_id": thread_id,
+                "mentioned": mentioned,
+            })
+
+        @client.on(telethon_events.MessageEdited())
+        async def _on_message_edited(event):
+            reply_to = event.message.reply_to
+            thread_id = getattr(reply_to, "reply_to_top_id", None) if reply_to else None
+            _enqueue({
+                "type": "message_edited",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "chat_id": event.chat_id,
+                "message_id": event.message.id,
+                "sender_id": event.sender_id,
+                "text": event.message.message or "",
+                "media_type": type(event.message.media).__name__ if event.message.media else None,
+                "thread_id": thread_id,
+            })
+
+        RAW_TYPES = (
+            tl_types.UpdateMessageReactions,
+            tl_types.UpdateDeleteMessages,
+            tl_types.UpdateDeleteChannelMessages,
+            tl_types.UpdateReadHistoryInbox,
+            tl_types.UpdateReadHistoryOutbox,
+            tl_types.UpdateUserTyping,
+            tl_types.UpdateChatUserTyping,
+            tl_types.UpdateUserStatus,
+        )
+
+        @client.on(telethon_events.Raw(RAW_TYPES))
+        async def _on_raw_update(event):
+            update_dict: dict = {
+                "type": type(event).__name__,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "data": repr(event),
+            }
+
+            # Try to extract chat_id so subscription filtering can apply
+            chat_id = None
+            if hasattr(event, "peer") and event.peer is not None:
+                try:
+                    chat_id = await client.get_peer_id(event.peer)
+                except Exception:
+                    pass
+            elif hasattr(event, "channel_id"):
+                try:
+                    chat_id = await client.get_peer_id(
+                        tl_types.PeerChannel(channel_id=event.channel_id)
+                    )
+                except Exception:
+                    pass
+
+            if chat_id is not None:
+                update_dict["chat_id"] = chat_id
+
+            _enqueue(update_dict)
+
+    async def get_user_info(self, entity: str | int) -> dict:
+        """Get profile info for a user, including bio and profile photo.
+
+        Args:
+            entity: Username, user ID, or phone number.
+
+        Returns:
+            dict with user details and optional profile_photo_path.
+        """
+        from telethon.tl import functions as tl_functions
+
+        user = await self.client.get_entity(entity)
+        full_result = await self.client(tl_functions.users.GetFullUserRequest(user))
+        full_user = full_result.full_user
+
+        status = user.status  # type: ignore
+        status_str = type(status).__name__ if status else None
+
+        info: dict = {
+            "id": user.id,  # type: ignore
+            "username": getattr(user, "username", None),
+            "first_name": getattr(user, "first_name", None),
+            "last_name": getattr(user, "last_name", None),
+            "is_bot": getattr(user, "bot", False),
+            "is_verified": getattr(user, "verified", False),
+            "is_restricted": getattr(user, "restricted", False),
+            "is_deleted": getattr(user, "deleted", False),
+            "bio": getattr(full_user, "about", None),
+            "status": status_str,
+            "profile_photo_path": None,
+        }
+
+        # Download current profile photo if one exists
+        if getattr(user, "photo", None):
+            try:
+                filename = f"profile_{user.id}.jpg"  # type: ignore
+                filepath = self._downloads_dir / filename
+                downloaded = await self.client.download_profile_photo(user, file=filepath)
+                if downloaded:
+                    info["profile_photo_path"] = str(filepath.resolve())
+            except Exception as e:
+                logger.warning(f"Failed to download profile photo for {entity}: {e}")
+
+        return info
+
+    async def get_group_info(self, entity: str | int) -> dict:
+        """Get info about a group or channel, including admins.
+
+        Args:
+            entity: Username, group/channel ID, or invite link.
+
+        Returns:
+            dict with group details, description, member count, and admin list.
+        """
+        from telethon.tl import functions as tl_functions
+        from telethon.tl.types import (
+            Channel,
+            ChannelParticipantsAdmins,
+            Chat,
+        )
+
+        group = await self.client.get_entity(entity)
+        info: dict = {}
+
+        if isinstance(group, Channel):
+            full_result = await self.client(
+                tl_functions.channels.GetFullChannelRequest(group)
+            )
+            full_chat = full_result.full_chat
+            info = {
+                "id": group.id,
+                "title": group.title,
+                "username": getattr(group, "username", None),
+                "type": "broadcast_channel" if group.broadcast else "supergroup",
+                "description": getattr(full_chat, "about", None),
+                "members_count": getattr(full_chat, "participants_count", None),
+                "is_forum": getattr(group, "forum", False),
+                "is_verified": getattr(group, "verified", False),
+                "is_restricted": getattr(group, "restricted", False),
+                "admins": [],
+            }
+            try:
+                async for participant in self.client.iter_participants(
+                    group, filter=ChannelParticipantsAdmins()
+                ):
+                    info["admins"].append({
+                        "id": participant.id,
+                        "username": getattr(participant, "username", None),
+                        "first_name": getattr(participant, "first_name", None),
+                        "last_name": getattr(participant, "last_name", None),
+                    })
+            except Exception as e:
+                logger.warning(f"Failed to fetch admins for {entity}: {e}")
+
+        elif isinstance(group, Chat):
+            full_result = await self.client(
+                tl_functions.messages.GetFullChatRequest(group.id)
+            )
+            full_chat = full_result.full_chat
+            info = {
+                "id": group.id,
+                "title": group.title,
+                "type": "group",
+                "description": getattr(full_chat, "about", None),
+                "members_count": getattr(group, "participants_count", None),
+                "admins": [],
+            }
+            if full_result.participants:
+                from telethon.tl.types import (
+                    ChatParticipantAdmin,
+                    ChatParticipantCreator,
+                )
+                users_by_id = {u.id: u for u in full_result.users}
+                for p in full_result.participants.participants:
+                    if isinstance(p, (ChatParticipantAdmin, ChatParticipantCreator)):
+                        u = users_by_id.get(p.user_id)
+                        if u:
+                            info["admins"].append({
+                                "id": u.id,
+                                "username": getattr(u, "username", None),
+                                "first_name": getattr(u, "first_name", None),
+                                "last_name": getattr(u, "last_name", None),
+                                "is_creator": isinstance(p, ChatParticipantCreator),
+                            })
+        else:
+            info = {
+                "id": getattr(group, "id", None),
+                "title": getattr(group, "title", str(group)),
+                "type": type(group).__name__,
+            }
+
+        return info
+
+    async def subscribe_chat(self, entity: str | int) -> dict:
+        """Subscribe to a chat so its messages wake the blocking get_pending_updates call.
+
+        Args:
+            entity: Username, chat ID, or phone number.
+
+        Returns:
+            dict with chat_id and subscribed=True.
+        """
+        peer = await self.client.get_entity(entity)
+        chat_id = await self.client.get_peer_id(peer)
+        self._subscribed_chats.add(chat_id)
+        self._save_subscriptions()
+        return {"chat_id": chat_id, "subscribed": True}
+
+    async def unsubscribe_chat(self, entity: str | int) -> dict:
+        """Unsubscribe from a chat.
+
+        Args:
+            entity: Username, chat ID, or phone number.
+
+        Returns:
+            dict with chat_id and subscribed=False.
+        """
+        peer = await self.client.get_entity(entity)
+        chat_id = await self.client.get_peer_id(peer)
+        self._subscribed_chats.discard(chat_id)
+        self._save_subscriptions()
+        return {"chat_id": chat_id, "subscribed": False}
+
+    def get_subscribed_chats(self) -> list[int]:
+        """Return the list of currently subscribed chat IDs."""
+        return list(self._subscribed_chats)
+
+    async def get_user_photos(
+        self,
+        entity: str | int,
+        download_all: bool = False,
+        download_index: int | None = None,
+    ) -> list[dict]:
+        """Get all profile photos for a user, with optional download.
+
+        Args:
+            entity: Username, user ID, or phone number.
+            download_all: If True, download all photos to local files.
+            download_index: If set, download only the photo at this index.
+
+        Returns:
+            list of dicts with index, photo_id, date, sizes, and optional path.
+        """
+        from telethon.tl import functions as tl_functions
+
+        user = await self.client.get_entity(entity)
+
+        result = await self.client(tl_functions.photos.GetUserPhotosRequest(
+            user_id=user,
+            offset=0,
+            max_id=0,
+            limit=100,
+        ))
+
+        output = []
+        for i, photo in enumerate(result.photos):
+            photo_info: dict = {
+                "index": i,
+                "photo_id": photo.id,
+                "date": photo.date.isoformat() if getattr(photo, "date", None) else None,
+                "sizes": [],
+                "path": None,
+            }
+
+            if hasattr(photo, "sizes"):
+                for s in photo.sizes:
+                    size_info: dict = {"type": getattr(s, "type", None)}
+                    if hasattr(s, "w"):
+                        size_info["w"] = s.w
+                    if hasattr(s, "h"):
+                        size_info["h"] = s.h
+                    if hasattr(s, "size"):
+                        size_info["size"] = s.size
+                    photo_info["sizes"].append(size_info)
+
+            should_download = download_all or (download_index is not None and download_index == i)
+            if should_download:
+                try:
+                    user_id = getattr(user, "id", str(entity))
+                    filename = f"profile_{user_id}_{i}.jpg"
+                    filepath = self._downloads_dir / filename
+                    downloaded = await self.client.download_media(photo, file=filepath)
+                    if downloaded:
+                        photo_info["path"] = str(Path(downloaded).resolve())
+                except Exception as e:
+                    logger.warning(f"Failed to download photo {i} for {entity}: {e}")
+
+            output.append(photo_info)
+
+        return output
+
+    async def get_forum_topics(self, entity: str | int, limit: int = 100) -> list[dict]:
+        """Get the list of topics (threads) in a forum-enabled supergroup.
+
+        Args:
+            entity: Username or ID of the forum group.
+            limit: Maximum number of topics to return. Defaults to 100.
+
+        Returns:
+            list of dicts, each containing topic id, title, top_message,
+            date, is_closed, is_pinned, and is_hidden.
+
+        Raises:
+            ValueError: If the entity is not a forum group.
+        """
+        from telethon.tl import functions as tl_functions
+
+        group = await self.client.get_entity(entity)
+
+        result = await self.client(
+            tl_functions.messages.GetForumTopicsRequest(
+                peer=group,
+                offset_date=0,
+                offset_id=0,
+                offset_topic=0,
+                limit=limit,
+                q=None,
+            )
+        )
+
+        topics = []
+        for topic in result.topics:
+            topics.append({
+                "id": topic.id,
+                "title": topic.title,
+                "top_message": topic.top_message,
+                "date": topic.date.isoformat() if topic.date else None,
+                "is_closed": getattr(topic, "closed", False),
+                "is_hidden": getattr(topic, "hidden", False),
+                "is_pinned": getattr(topic, "pinned", False),
+            })
+
+        return topics
 
     async def send_message(
         self,
