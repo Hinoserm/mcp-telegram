@@ -243,7 +243,7 @@ class Telegram:
         async def _on_message_edited(event):
             reply_to = event.message.reply_to
             thread_id = getattr(reply_to, "reply_to_top_id", None) if reply_to else None
-            _enqueue({
+            update: dict = {
                 "type": "message_edited",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "chat_id": event.chat_id,
@@ -252,7 +252,29 @@ class Telegram:
                 "text": event.message.message or "",
                 "media_type": type(event.message.media).__name__ if event.message.media else None,
                 "thread_id": thread_id,
-            })
+            }
+            # In DMs, reactions come through as UpdateEditMessage rather than
+            # UpdateMessageReactions. Extract them here so callers see them either way.
+            try:
+                msg_reactions = getattr(event.message, "reactions", None)
+                if msg_reactions and getattr(msg_reactions, "results", None):
+                    reactions_out = []
+                    for rc in msg_reactions.results:
+                        r = rc.reaction
+                        emoji = None
+                        if hasattr(r, "emoticon"):
+                            emoji = r.emoticon
+                        elif hasattr(r, "document_id"):
+                            emoji = f"custom:{r.document_id}"
+                        reactions_out.append({
+                            "emoji": emoji,
+                            "count": rc.count,
+                            "chosen": getattr(rc, "chosen_order", None) is not None,
+                        })
+                    update["reactions"] = reactions_out
+            except Exception:
+                pass
+            _enqueue(update)
 
         RAW_TYPES = (
             tl_types.UpdateMessageReactions,
