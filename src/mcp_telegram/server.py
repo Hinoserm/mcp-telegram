@@ -34,6 +34,11 @@ mcp = FastMCP(
 )
 
 
+def run_server() -> None:
+    """Run the MCP server."""
+    mcp.run()
+
+
 @mcp.tool()
 async def send_message(
     entity: str,
