@@ -709,6 +709,7 @@ class Telegram:
         end_date: datetime | None = None,
         unread: bool = False,
         mark_as_read: bool = False,
+        topic_id: int | None = None,
     ) -> Messages:
         """Get messages from a specific entity.
 
@@ -725,6 +726,10 @@ class Telegram:
                 Whether to get only unread messages. Defaults to False.
             mark_as_read (`bool`, optional):
                 Whether to mark the messages as read. Defaults to False.
+            topic_id (`int`, optional):
+                The forum topic ID to filter messages by. Only returns messages
+                from this specific topic/thread. Use `get_forum_topics` to find
+                topic IDs. Defaults to None (all messages).
 
         Returns:
             `list[Message]`:
@@ -754,10 +759,14 @@ class Telegram:
             limit = min(limit, dialog.unread_messages_count)
 
         results: list[Message] = []
-        async for message in self.client.iter_messages(  # type: ignore
-            _entity,
-            offset_date=end_date,  # fetching messages older than end_date
-        ):
+        iter_kwargs: dict[str, Any] = {
+            "entity": _entity,
+            "offset_date": end_date,
+        }
+        if topic_id is not None:
+            iter_kwargs["reply_to"] = topic_id
+
+        async for message in self.client.iter_messages(**iter_kwargs):  # type: ignore
             # Skip service messages and empty messages immediately
             if not isinstance(message, patched.Message) or isinstance(
                 message, patched.MessageService | patched.MessageEmpty

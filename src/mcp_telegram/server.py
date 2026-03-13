@@ -240,6 +240,7 @@ async def get_messages(
     end_date: datetime | None = None,
     unread: bool = False,
     mark_as_read: bool = False,
+    topic_id: int | None = None,
 ) -> Messages:
     """Get messages from a specific entity.
 
@@ -273,6 +274,12 @@ async def get_messages(
             Whether to mark the messages as read.
             Defaults to False.
 
+        topic_id (`int`, optional):
+            The forum topic ID to filter messages by. Only returns messages
+            from this specific topic/thread in a forum-enabled group. Use
+            `get_forum_topics` to find available topic IDs. Defaults to None
+            (all messages).
+
     Returns:
         `Messages`:
             A list of messages from the entity and the dialog the messages
@@ -288,6 +295,7 @@ async def get_messages(
         end_date,
         unread,
         mark_as_read,
+        topic_id,
     )
 
 
