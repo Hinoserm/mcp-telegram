@@ -33,6 +33,11 @@ mcp = FastMCP(
     lifespan=app_lifespan,
 )
 
+# Serializes concurrent MCP tool calls to prevent SQLite "database is locked"
+# errors from Telethon's session storage. Not used for get_pending_updates
+# (which blocks for long periods) or list_subscribed_chats (sync, no DB access).
+_tg_lock = asyncio.Lock()
+
 
 def run_server() -> None:
     """Run the MCP server."""
@@ -72,15 +77,15 @@ async def send_message(
         `str`:
             A success message if sent, or an error message if failed.
     """
-
     _entity = parse_entity(entity)
 
-    await tg.send_message(
-        _entity,
-        message,
-        file_path=file_path,
-        reply_to=reply_to,
-    )
+    async with _tg_lock:
+        await tg.send_message(
+            _entity,
+            message,
+            file_path=file_path,
+            reply_to=reply_to,
+        )
 
     return f"Message sent to {entity}"
 
@@ -106,10 +111,10 @@ async def edit_message(entity: str, message_id: int, message: str) -> str:
         `str`:
             A success message if edited, or an error message if failed.
     """
-
     _entity = parse_entity(entity)
 
-    await tg.edit_message(_entity, message_id, message)
+    async with _tg_lock:
+        await tg.edit_message(_entity, message_id, message)
 
     return f"Message edited in {entity}"
 
@@ -134,10 +139,10 @@ async def delete_message(entity: str, message_ids: list[int]) -> str:
         `str`:
             A success message if deleted, or an error message if failed.
     """
-
     _entity = parse_entity(entity)
 
-    await tg.delete_message(_entity, message_ids)
+    async with _tg_lock:
+        await tg.delete_message(_entity, message_ids)
 
     return f"Messages deleted from {entity}"
 
@@ -170,8 +175,8 @@ async def search_dialogs(
         `list[Dialog]`: A list of dialogs that match the query if successful,
             or an error message if request failed.
     """
-
-    return await tg.search_dialogs(query, limit, global_search)
+    async with _tg_lock:
+        return await tg.search_dialogs(query, limit, global_search)
 
 
 @mcp.tool()
@@ -195,10 +200,10 @@ async def get_draft(entity: str) -> str:
             The draft message (empty string if no draft) for the specific entity
             or an error message if request failed.
     """
-
     _entity = parse_entity(entity)
 
-    return await tg.get_draft(_entity)
+    async with _tg_lock:
+        return await tg.get_draft(_entity)
 
 
 @mcp.tool()
@@ -224,10 +229,10 @@ async def set_draft(entity: str, message: str) -> str:
         `str`:
             A success message if saved, or an error message if failed.
     """
-
     _entity = parse_entity(entity)
 
-    await tg.set_draft(_entity, message)
+    async with _tg_lock:
+        await tg.set_draft(_entity, message)
 
     return f"Draft saved for {_entity}"
 
@@ -285,18 +290,18 @@ async def get_messages(
             A list of messages from the entity and the dialog the messages
             belong to if successful, or an error message if request failed.
     """
-
     _entity = parse_entity(entity)
 
-    return await tg.get_messages(
-        _entity,
-        limit,
-        start_date,
-        end_date,
-        unread,
-        mark_as_read,
-        topic_id,
-    )
+    async with _tg_lock:
+        return await tg.get_messages(
+            _entity,
+            limit,
+            start_date,
+            end_date,
+            unread,
+            mark_as_read,
+            topic_id,
+        )
 
 
 @mcp.tool()
@@ -331,7 +336,8 @@ async def media_download(
     """
     _entity = parse_entity(entity)
 
-    return await tg.download_media(_entity, message_id, path)
+    async with _tg_lock:
+        return await tg.download_media(_entity, message_id, path)
 
 
 @mcp.tool()
@@ -349,8 +355,8 @@ async def message_from_link(link: str) -> Message:
     Returns:
         `Message`: The message from the link if successful, or an error message.
     """
-
-    return await tg.message_from_link(link)
+    async with _tg_lock:
+        return await tg.message_from_link(link)
 
 
 @mcp.tool()
@@ -422,7 +428,9 @@ async def subscribe_chat(entity: str) -> dict:
         `dict`: chat_id and subscribed=True on success.
     """
     _entity = parse_entity(entity)
-    return await tg.subscribe_chat(_entity)
+
+    async with _tg_lock:
+        return await tg.subscribe_chat(_entity)
 
 
 @mcp.tool()
@@ -436,7 +444,9 @@ async def unsubscribe_chat(entity: str) -> dict:
         `dict`: chat_id and subscribed=False on success.
     """
     _entity = parse_entity(entity)
-    return await tg.unsubscribe_chat(_entity)
+
+    async with _tg_lock:
+        return await tg.unsubscribe_chat(_entity)
 
 
 @mcp.tool()
@@ -465,7 +475,9 @@ async def get_forum_topics(entity: str, limit: int = 100) -> list[dict]:
             date, is_closed, is_pinned, and is_hidden.
     """
     _entity = parse_entity(entity)
-    return await tg.get_forum_topics(_entity, limit)
+
+    async with _tg_lock:
+        return await tg.get_forum_topics(_entity, limit)
 
 
 @mcp.tool()
@@ -490,7 +502,9 @@ async def get_user_photos(
             sizes (list of {type, w, h, size}), and path (if downloaded).
     """
     _entity = parse_entity(entity)
-    return await tg.get_user_photos(_entity, download_all, download_index)
+
+    async with _tg_lock:
+        return await tg.get_user_photos(_entity, download_all, download_index)
 
 
 @mcp.tool()
@@ -508,7 +522,9 @@ async def get_user_info(entity: str) -> dict:
             is_bot, is_verified, status, and profile_photo_path (if available).
     """
     _entity = parse_entity(entity)
-    return await tg.get_user_info(_entity)
+
+    async with _tg_lock:
+        return await tg.get_user_info(_entity)
 
 
 @mcp.tool()
@@ -526,4 +542,6 @@ async def get_group_info(entity: str) -> dict:
             is_forum, is_verified, and admins list.
     """
     _entity = parse_entity(entity)
-    return await tg.get_group_info(_entity)
+
+    async with _tg_lock:
+        return await tg.get_group_info(_entity)
